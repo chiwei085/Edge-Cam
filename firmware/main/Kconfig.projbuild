@@ -1,0 +1,27 @@
+menu "Edge camera"
+
+    config EDGECAM_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config EDGECAM_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config EDGECAM_TCP_PORT
+        int "TCP port the board listens on"
+        default 5000
+
+    config EDGECAM_GATE_PERMILLE
+        int "Send a frame when this many pixels per mille changed"
+        default 20
+
+    config EDGECAM_GATE_COPY_INTERNAL
+        bool "Copy each JPEG from PSRAM to internal RAM before the gate decodes it"
+        default n
+
+    config EDGECAM_KEEPALIVE_MS
+        int "Send a frame at least this often even without motion"
+        default 2000
+
+endmenu

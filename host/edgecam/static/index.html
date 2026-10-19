@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge Camera</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee; --muted: #8a91a3;
+    --grab: #5b8def; --gate: #8b6cf0; --net: #e5a24a; --infer: #3fbf8f; --pc: #5fb7c9;
+    --ok: #3fbf8f; --bad: #e0605a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 "Segoe UI", "Noto Sans TC", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  #status { color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 640px) minmax(300px, 1fr); gap: 16px; padding: 16px 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .panel h2 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+              letter-spacing: .06em; margin: 0 0 10px; }
+  #view { width: 100%; aspect-ratio: 4 / 3; display: block; background: #000; border-radius: 6px; }
+  .side { display: flex; flex-direction: column; gap: 16px; }
+  .stack { display: flex; height: 22px; border-radius: 4px; overflow: hidden; background: var(--line); }
+  .stack div { height: 100%; }
+  .rows { display: grid; grid-template-columns: 14px 1fr auto; gap: 4px 8px; margin-top: 10px; align-items: center; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; }
+  .num { font-variant-numeric: tabular-nums; text-align: right; }
+  .big { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .kpi .label { color: var(--muted); font-size: 12px; }
+  .lcd { font: 18px/1.3 "Consolas", monospace; background: #2f4f1a; color: #d7f5b0; padding: 8px 10px;
+         border-radius: 4px; white-space: pre; letter-spacing: .04em; }
+  #history { width: 100%; height: 140px; display: block; }
+  .wide { grid-column: 1 / -1; }
+  .muted { color: var(--muted); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Edge Camera</h1>
+  <span id="status">等待板子連線</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>影像與偵測</h2>
+    <canvas id="view" width="640" height="480"></canvas>
+    <div class="muted" id="meta" style="margin-top:8px">&nbsp;</div>
+  </section>
+
+  <div class="side">
+    <section class="panel">
+      <h2>延遲分解 (上一張完整來回)</h2>
+      <div class="stack" id="stack"></div>
+      <div class="rows" id="rows"></div>
+      <div style="margin-top:10px"><span class="muted">端到端</span> <span class="big" id="e2e">-</span> <span class="muted">ms</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>邊緣端 Gating</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="label">擷取</div><div class="big" id="total">-</div></div>
+        <div class="kpi"><div class="label">送出</div><div class="big" id="sent">-</div></div>
+        <div class="kpi"><div class="label">省下</div><div class="big" id="saved">-</div></div>
+      </div>
+      <div class="muted" style="margin-top:6px" id="gateinfo">&nbsp;</div>
+    </section>
+
+    <section class="panel">
+      <h2>偵測摘要</h2>
+      <div class="lcd" id="lcd">
+                </div>
+    </section>
+  </div>
+
+  <section class="panel wide">
+    <h2>延遲歷史 (每張送出的影像)</h2>
+    <canvas id="history" height="140"></canvas>
+  </section>
+</main>
+
+<script>
+const css = getComputedStyle(document.documentElement);
+const color = n => css.getPropertyValue(n).trim();
+const PARTS = [
+  { key: "grab",   label: "相機擷取",          c: color("--grab") },
+  { key: "gate",   label: "Gating (板上)",     c: color("--gate") },
+  { key: "net",    label: "Wi-Fi 傳輸 (來回)", c: color("--net") },
+  { key: "infer",  label: "YOLO 推論",         c: color("--infer") },
+  { key: "pc",     label: "PC 解碼與前後處理", c: color("--pc") },
+];
+
+const view = document.getElementById("view");
+const vctx = view.getContext("2d");
+const hist = document.getElementById("history");
+const hctx = hist.getContext("2d");
+const history = [];
+let prevFrame = null;
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "status") setStatus(m);
+    else if (m.type === "frame") onFrame(m);
+  };
+  ws.onclose = () => { setStatus({ connected: false, detail: "dashboard 斷線，重新連線中" }); setTimeout(connect, 1000); };
+}
+
+function setStatus(m) {
+  document.getElementById("dot").classList.toggle("on", m.connected);
+  document.getElementById("status").textContent = m.connected ? `已連線 ${m.detail}` : `未連線 ${m.detail || ""}`;
+}
+
+function onFrame(m) {
+  drawFrame(m);
+  const t = m.timing_ms;
+  document.getElementById("meta").textContent =
+    `#${m.seq} · ${m.width}×${m.height} · ${(m.jpeg_bytes / 1024).toFixed(1)} KB · ` +
+    `${m.keepalive ? "定時送出" : "偵測到變化"} (diff ${m.diff_permille}‰) · ${m.stats.result_fps.toFixed(1)} fps`;
+
+  // The board reports the round trip of the previous frame, so pair it with
+  // the timings we kept from that frame.
+  if (prevFrame && m.prev_ms.network != null) {
+    const p = prevFrame.timing_ms;
+    const parts = {
+      grab: p.grab, gate: p.gate, net: m.prev_ms.network,
+      infer: p.infer, pc: Math.max(p.pc_total - p.infer, 0),
+    };
+    showBreakdown(parts);
+    history.push(parts);
+    if (history.length > 80) history.shift();
+    drawHistory();
+  }
+  prevFrame = m;
+
+  const s = m.stats;
+  document.getElementById("total").textContent = s.frames_total;
+  document.getElementById("sent").textContent = s.frames_sent;
+  document.getElementById("saved").textContent =
+    s.frames_total ? `${Math.round(100 * (1 - s.frames_sent / s.frames_total))}%` : "-";
+  document.getElementById("gateinfo").textContent =
+    `Gating 每張 ${t.gate.toFixed(1)} ms (1/8 解碼 + 畫面差異)`;
+  document.getElementById("lcd").textContent = m.lcd.map(r => r.padEnd(16)).join("\n");
+}
+
+function drawFrame(m) {
+  const img = new Image();
+  img.onload = () => {
+    vctx.drawImage(img, 0, 0, view.width, view.height);
+    const sx = view.width / m.width, sy = view.height / m.height;
+    vctx.lineWidth = 2;
+    vctx.font = "14px Segoe UI, sans-serif";
+    for (const b of m.boxes) {
+      const x = b.x1 * sx, y = b.y1 * sy, w = (b.x2 - b.x1) * sx, h = (b.y2 - b.y1) * sy;
+      vctx.strokeStyle = color("--infer");
+      vctx.strokeRect(x, y, w, h);
+      const text = `${b.label} ${(b.conf * 100).toFixed(0)}%`;
+      const tw = vctx.measureText(text).width + 8;
+      vctx.fillStyle = color("--infer");
+      vctx.fillRect(x, Math.max(y - 20, 0), tw, 20);
+      vctx.fillStyle = "#0b1a14";
+      vctx.fillText(text, x + 4, Math.max(y - 5, 15));
+    }
+  };
+  img.src = "data:image/jpeg;base64," + m.jpeg;
+}
+
+function showBreakdown(parts) {
+  const total = PARTS.reduce((a, p) => a + parts[p.key], 0);
+  document.getElementById("stack").innerHTML = PARTS.map(p =>
+    `<div style="width:${100 * parts[p.key] / total}%;background:${p.c}" title="${p.label}"></div>`).join("");
+  document.getElementById("rows").innerHTML = PARTS.map(p =>
+    `<span class="sw" style="background:${p.c}"></span><span>${p.label}</span>` +
+    `<span class="num">${parts[p.key].toFixed(1)} ms</span>`).join("");
+  document.getElementById("e2e").textContent = total.toFixed(0);
+}
+
+function drawHistory() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = hist.clientWidth, H = hist.clientHeight;
+  hist.width = W * dpr; hist.height = H * dpr;
+  hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  hctx.clearRect(0, 0, W, H);
+  const totals = history.map(h => PARTS.reduce((a, p) => a + h[p.key], 0));
+  const max = Math.max(50, ...totals) * 1.1;
+  const slot = W / 80, bw = Math.max(slot - 2, 1);
+  history.forEach((h, i) => {
+    let y = H;
+    for (const p of PARTS) {
+      const ph = H * h[p.key] / max;
+      hctx.fillStyle = p.c;
+      hctx.fillRect(i * slot, y - ph, bw, ph);
+      y -= ph;
+    }
+  });
+  hctx.fillStyle = color("--muted");
+  hctx.font = "12px Segoe UI, sans-serif";
+  hctx.fillText(`${max.toFixed(0)} ms`, 4, 12);
+}
+
+connect();
+</script>
+</body>
+</html>

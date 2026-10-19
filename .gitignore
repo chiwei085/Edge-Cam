@@ -1,0 +1,10 @@
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/secrets.defaults
+host/.venv/
+__pycache__/
+*.pt
+.vscode/
+eim_config.toml
